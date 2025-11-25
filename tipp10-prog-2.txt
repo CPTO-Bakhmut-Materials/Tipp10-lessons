@@ -1,0 +1,412 @@
+func _init(_frames: Array[Frame] = [], _name := tr("untitled"), _size := Vector2i(64, 64)) -> void:
+frames = _frames
+name = _name
+size = _size
+tiles = Tiles.new(size)
+selection_map.copy_from(Image.create(size.x, size.y, false, Image.FORMAT_LA8))
+Global.tabs.add_tab(name)
+undo_redo.max_steps = Global.max_undo_steps
+
+x_symmetry_point = size.x - 1
+y_symmetry_point = size.y - 1
+xy_symmetry_point = size * 0.5
+x_minus_y_symmetry_point = xy_symmetry_point
+x_symmetry_axis.type = Guide.Types.HORIZONTAL
+x_symmetry_axis.project = self
+x_symmetry_axis.add_point(Vector2(-19999, y_symmetry_point / 2 + 0.5))
+x_symmetry_axis.add_point(Vector2(19999, y_symmetry_point / 2 + 0.5))
+Global.canvas.add_child(x_symmetry_axis)
+
+y_symmetry_axis.type = Guide.Types.VERTICAL
+y_symmetry_axis.project = self
+y_symmetry_axis.add_point(Vector2(x_symmetry_point / 2 + 0.5, -19999))
+y_symmetry_axis.add_point(Vector2(x_symmetry_point / 2 + 0.5, 19999))
+Global.canvas.add_child(y_symmetry_axis)
+
+diagonal_xy_symmetry_axis.type = Guide.Types.XY
+diagonal_xy_symmetry_axis.project = self
+diagonal_xy_symmetry_axis.add_point(Vector2(19999, -19999))
+diagonal_xy_symmetry_axis.add_point(Vector2(-19999, 19999) + xy_symmetry_point * 2.0)
+Global.canvas.add_child(diagonal_xy_symmetry_axis)
+
+diagonal_x_minus_y_symmetry_axis.type = Guide.Types.X_MINUS_Y
+diagonal_x_minus_y_symmetry_axis.project = self
+diagonal_x_minus_y_symmetry_axis.add_point(Vector2(-19999, -19999))
+diagonal_x_minus_y_symmetry_axis.add_point(
+Vector2(19999, 19999) + x_minus_y_symmetry_point * 2.0
+)
+Global.canvas.add_child(diagonal_x_minus_y_symmetry_axis)
+
+if OS.get_name() == "Web":
+export_directory_path = "user://"
+else:
+export_directory_path = Global.config_cache.get_value(
+"data", "current_dir", OS.get_system_dir(OS.SYSTEM_DIR_DESKTOP)
+)
+Global.project_created.emit(self)
+
+
+func remove() -> void:
+undo_redo.free()
+for ri in reference_images:
+ri.queue_free()
+for guide in guides:
+guide.queue_free()
+for frame in frames:
+for l in layers.size():
+var cel: BaseCel = frame.cels[l]
+cel.on_remove()
+# Prevents memory leak (due to the layers' project reference stopping ref counting from freeing)
+layers.clear()
+Global.projects.erase(self)
+removed.emit()
+
+
+func commit_undo() -> void:
+if not can_undo:
+return
+if Global.canvas.selection.transformation_handles.is_transforming_content():
+Global.canvas.selection.transform_content_cancel()
+else:
+undo_redo.undo()
+
+
+func commit_redo() -> void:
+if not can_undo:
+return
+Global.control.redone = true
+undo_redo.redo()
+Global.control.redone = false
+
+
+func new_empty_frame() -> Frame:
+var frame := Frame.new()
+var bottom_layer := true
+for l in layers:  # Create as many cels as there are layers
+var cel := l.new_empty_cel()
+if cel is PixelCel and bottom_layer and fill_color.a > 0:
+cel.image.fill(fill_color)
+frame.cels.append(cel)
+bottom_layer = false
+return frame
+
+
+## Returns a new [Image] of size [member size] and format [method get_image_format].
+func new_empty_image() -> Image:
+return Image.create(size.x, size.y, false, get_image_format())
+
+
+## Returns the currently selected [BaseCel].
+func get_current_cel() -> BaseCel:
+return frames[current_frame].cels[current_layer]
+
+
+func get_image_format() -> Image.Format:
+if color_mode == INDEXED_MODE:
+return Image.FORMAT_RGBA8
+return color_mode as Image.Format
+
+
+func is_indexed() -> bool:
+return color_mode == INDEXED_MODE
+
+
+func selection_map_changed() -> void:
+has_selection = !selection_map.is_invisible()
+var transformation_handles := Global.canvas.selection.transformation_handles
+if has_selection:
+var used_map := SelectionMap.new()
+used_map.copy_from(selection_map.get_region(selection_map.get_used_rect()))
+transformation_handles.set_selection(used_map, selection_map.get_selection_rect(self))
+else:
+transformation_handles.set_selection(null, Rect2i())
+Global.top_menu_container.edit_menu.set_item_disabled(Global.EditMenu.NEW_BRUSH, !has_selection)
+Global.top_menu_container.project_menu.set_item_disabled(
+Global.ProjectMenu.CROP_TO_SELECTION, !has_selection
+)
+
+
+func change_project() -> void:
+animation_tags = animation_tags
+# Change the project brushes
+Brushes.clear_project_brush()
+for brush in brushes:
+Brushes.add_project_brush(brush)
+Global.transparent_checker.update_rect()
+Global.get_window().title = "%s - Pixelorama %s" % [name, Global.current_version]
+if has_changed:
+Global.get_window().title = Global.get_window().title + "(*)"
+selection_map_changed()
+
+
+func serialize() -> Dictionary:
+var layer_data := []
+for layer in layers:
+layer_data.append(layer.serialize())
+layer_data[-1]["metadata"] = _serialize_metadata(layer)
+var palette_data := []
+for palette_name in palettes:
+var data: String = palettes[palette_name].serialize()
+palette_data.append({palette_name: data})
+var tag_data := []
+for tag in animation_tags:
+tag_data.append(tag.serialize())
+var guide_data := []
+for guide in guides:
+if guide is SymmetryGuide:
+continue
+if !is_instance_valid(guide):
+continue
+var coords := guide.points[0].x
+if guide.type == Guide.Types.HORIZONTAL:
+coords = guide.points[0].y
+guide_data.append({"type": guide.type, "pos": coords})
+
+var frame_data := []
+for frame in frames:
+var cel_data := []
+for cel in frame.cels:
+cel_data.append(cel.serialize())
+cel_data[-1]["metadata"] = _serialize_metadata(cel)
+
+var current_frame_data := {
+"cels": cel_data, "duration": frame.duration, "metadata": _serialize_metadata(frame)
+}
+if not frame.user_data.is_empty():
+current_frame_data["user_data"] = frame.user_data
+frame_data.append(current_frame_data)
+var brush_data := []
+for brush in brushes:
+brush_data.append({"size_x": brush.get_size().x, "size_y": brush.get_size().y})
+
+var reference_image_data := []
+for reference_image in reference_images:
+reference_image_data.append(reference_image.serialize())
+var tileset_data := []
+for tileset in tilesets:
+tileset_data.append(tileset.serialize())
+
+var metadata := _serialize_metadata(self)
+
+var project_data := {
+"pixelorama_version": Global.current_version,
+"pxo_version": ProjectSettings.get_setting("application/config/Pxo_Version"),
+"size_x": size.x,
+"size_y": size.y,
+"color_mode": color_mode,
+"tile_mode_x_basis_x": tiles.x_basis.x,
+"tile_mode_x_basis_y": tiles.x_basis.y,
+"tile_mode_y_basis_x": tiles.y_basis.x,
+"tile_mode_y_basis_y": tiles.y_basis.y,
+"layers": layer_data,
+"tags": tag_data,
+"guides": guide_data,
+"symmetry_points": [x_symmetry_point, y_symmetry_point],
+"frames": frame_data,
+"current_frame": current_frame,
+"current_layer": current_layer,
+"brushes": brush_data,
+"palettes": palette_data,
+"project_current_palette_name": project_current_palette_name,
+"reference_images": reference_image_data,
+"tilesets": tileset_data,
+"vanishing_points": vanishing_points,
+"export_file_name": file_name,
+"export_file_format": file_format,
+"fps": fps,
+"user_data": user_data,
+"metadata": metadata
+}
+
+serialized.emit(project_data)
+return project_data
+
+
+func deserialize(dict: Dictionary, zip_reader: ZIPReader = null, file: FileAccess = null) -> void:
+about_to_deserialize.emit(dict)
+var pxo_version = dict.get(
+"pxo_version", ProjectSettings.get_setting("application/config/Pxo_Version")
+)
+if dict.has("size_x") and dict.has("size_y"):
+size.x = dict.size_x
+size.y = dict.size_y
+tiles.tile_size = size
+selection_map.crop(size.x, size.y)
+color_mode = dict.get("color_mode", color_mode)
+if dict.has("tile_mode_x_basis_x") and dict.has("tile_mode_x_basis_y"):
+tiles.x_basis.x = dict.tile_mode_x_basis_x
+tiles.x_basis.y = dict.tile_mode_x_basis_y
+if dict.has("tile_mode_y_basis_x") and dict.has("tile_mode_y_basis_y"):
+tiles.y_basis.x = dict.tile_mode_y_basis_x
+tiles.y_basis.y = dict.tile_mode_y_basis_y
+if dict.has("tilesets"):
+for saved_tileset in dict["tilesets"]:
+var tile_size = str_to_var("Vector2i" + saved_tileset.get("tile_size"))
+var tile_shape = dict.get("tile_shape", TileSet.TILE_SHAPE_SQUARE)
+var tileset := TileSetCustom.new(tile_size, "", tile_shape, false)
+tileset.deserialize(saved_tileset)
+tilesets.append(tileset)
+if dict.has("palettes"):
+# The actual palette name could be different if a global palette of the same name is
+# already present, so we need that palette's valid name.
+var current_palette_name: String = dict.get("project_current_palette_name", "")
+if current_palette_name != "":
+current_palette_name = Palettes.get_valid_name(current_palette_name, self)
+for palette_entry: Dictionary in dict["palettes"]:
+if palette_entry.keys().size() == 1:  # Failsafe
+var palette_name: String = palette_entry.keys()[0]
+# There may be a case where a Global palette has same name as project palette
+var corrected_palette_name := Palettes.get_valid_name(palette_name, self)
+var palette := Palette.new(corrected_palette_name, true)
+palette.is_project_palette = true
+palette.deserialize(palette_entry[palette_name])
+palettes[corrected_palette_name] = palette
+project_current_palette_name = current_palette_name
+if dict.has("frames") and dict.has("layers"):
+var audio_layers := 0
+for saved_layer in dict.layers:
+match int(saved_layer.get("type", Global.LayerTypes.PIXEL)):
+Global.LayerTypes.PIXEL:
+layers.append(PixelLayer.new(self))
+Global.LayerTypes.GROUP:
+layers.append(GroupLayer.new(self))
+Global.LayerTypes.THREE_D:
+layers.append(Layer3D.new(self))
+Global.LayerTypes.TILEMAP:
+layers.append(LayerTileMap.new(self, null))
+Global.LayerTypes.AUDIO:
+var layer := AudioLayer.new(self)
+var audio_path := "audio/%s" % audio_layers
+if zip_reader.file_exists(audio_path):
+var audio_data := zip_reader.read_file(audio_path)
+var stream: AudioStream
+if saved_layer.get("audio_type", "") == "AudioStreamMP3":
+stream = AudioStreamMP3.new()
+stream.data = audio_data
+elif saved_layer.get("audio_type", "") == "AudioStreamWAV":
+stream = AudioStreamWAV.load_from_buffer(audio_data)
+layer.audio = stream
+layers.append(layer)
+audio_layers += 1
+
+var frame_i := 0
+for frame in dict.frames:
+var cels: Array[BaseCel] = []
+var cel_i := 0
+for cel in frame.cels:
+var layer := layers[cel_i]
+match layer.get_layer_type():
+Global.LayerTypes.PIXEL:
+var image := _load_image_from_pxo(frame_i, cel_i, zip_reader, file)
+cels.append(PixelCel.new(image))
+Global.LayerTypes.GROUP:
+cels.append(GroupCel.new())
+Global.LayerTypes.THREE_D:
+if is_instance_valid(file):  # For pxo files saved in 0.x
+# Don't do anything with it, just read it so that the file can move on
+file.get_buffer(size.x * size.y * 4)
+cels.append(Cel3D.new(size, true))
+Global.LayerTypes.TILEMAP:
+var image := _load_image_from_pxo(frame_i, cel_i, zip_reader, file)
+var tileset_index = dict.layers[cel_i].tileset_index
+var tileset := tilesets[tileset_index]
+var new_cel := CelTileMap.new(tileset, image)
+cels.append(new_cel)
+Global.LayerTypes.AUDIO:
+cels.append(AudioCel.new())
+cel["pxo_version"] = pxo_version
+cels[cel_i].deserialize(cel)
+_deserialize_metadata(cels[cel_i], cel)
+cel_i += 1
+var duration := 1.0
+if frame.has("duration"):
+duration = frame.duration
+elif dict.has("frame_duration"):
+duration = dict.frame_duration[frame_i]
+
+var frame_class := Frame.new(cels, duration)
+frame_class.user_data = frame.get("user_data", "")
+_deserialize_metadata(frame_class, frame)
+frames.append(frame_class)
+frame_i += 1
+
+# Parent references to other layers are created when deserializing
+# a layer, so loop again after creating them:
+for layer_i in dict.layers.size():
+var layer := layers[layer_i]
+layer.index = layer_i
+var layer_dict: Dictionary = dict.layers[layer_i]
+# Ensure that loaded pxo files from v1.0-v1.0.3 have the correct
+# blend mode, after the addition of the Erase mode in v1.0.4.
+if pxo_version < 4 and layer_dict.has("blend_mode"):
+var blend_mode: int = layer_dict.get("blend_mode")
+if blend_mode >= BaseLayer.BlendModes.ERASE:
+blend_mode += 1
+layer_dict["blend_mode"] = blend_mode
+layer.deserialize(layer_dict)
+_deserialize_metadata(layer, dict.layers[layer_i])
+if layer is LayerTileMap:
+for frame in frames:
+for cel_i in frame.cels.size():
+if cel_i == layer_i:
+# Call deferred to ensure the tileset has been loaded first
+layer.pass_variables_to_cel.call_deferred(frame.cels[cel_i])
+if dict.has("tags"):
+for tag in dict.tags:
+var new_tag := AnimationTag.new(tag.name, Color(tag.color), tag.from, tag.to)
+new_tag.user_data = tag.get("user_data", "")
+animation_tags.append(new_tag)
+animation_tags = animation_tags
+if dict.has("guides"):
+for g in dict.guides:
+var guide := Guide.new()
+guide.type = g.type
+if guide.type == Guide.Types.HORIZONTAL:
+guide.add_point(Vector2(-99999, g.pos))
+guide.add_point(Vector2(99999, g.pos))
+else:
+guide.add_point(Vector2(g.pos, -99999))
+guide.add_point(Vector2(g.pos, 99999))
+guide.has_focus = false
+guide.project = self
+Global.canvas.add_child(guide)
+if dict.has("reference_images"):
+for g in dict.reference_images:
+var ri := ReferenceImage.new()
+ri.project = self
+ri.deserialize(g)
+Global.canvas.reference_image_container.add_child(ri)
+if dict.has("vanishing_points"):
+vanishing_points = dict.vanishing_points
+if dict.has("symmetry_points"):
+x_symmetry_point = dict.symmetry_points[0]
+y_symmetry_point = dict.symmetry_points[1]
+for point in x_symmetry_axis.points.size():
+x_symmetry_axis.points[point].y = floorf(y_symmetry_point / 2 + 1)
+for point in y_symmetry_axis.points.size():
+y_symmetry_axis.points[point].x = floorf(x_symmetry_point / 2 + 1)
+file_name = dict.get("export_file_name", file_name)
+file_format = dict.get("export_file_format", file_name)
+fps = dict.get("fps", file_name)
+user_data = dict.get("user_data", user_data)
+var loaded_current_frame = dict.get("current_frame", current_frame)
+var loaded_current_layer = dict.get("current_layer", current_layer)
+_deserialize_metadata(self, dict)
+order_layers()
+selected_cels.clear()
+change_cel.call_deferred(loaded_current_frame, loaded_current_layer)
+
+
+func _serialize_metadata(object: Object) -> Dictionary:
+var metadata := {}
+for meta in object.get_meta_list():
+metadata[meta] = object.get_meta(meta)
+return metadata
+
+
+func _deserialize_metadata(object: Object, dict: Dictionary) -> void:
+if not dict.has("metadata"):
+return
+var metadata: Dictionary = dict["metadata"]
+for meta in metadata.keys():
+object.set_meta(meta, metadata[meta])
